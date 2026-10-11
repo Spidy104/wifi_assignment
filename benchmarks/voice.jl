@@ -79,20 +79,21 @@ function hypotheses(; seeds=1:50)
         seed_delay = Float64[]
         seed_combined = Float64[]
         seed_bitrate = Float64[]
+        under(cfg, policy) = simulate_voice(W, assignment; cfg=VoiceSimConfig(cfg; policy))
         for load in (0.70, 0.85, 0.95, 1.05)
             cfg = VoiceSimConfig(duration_s=5.0, calls_per_ap=32, background_load=load)
-            deadline = simulate_voice(W, assignment; policy=:deadline, cfg=cfg)
-            adaptive = simulate_voice(W, assignment; policy=:adaptive, cfg=cfg)
-            combined = simulate_voice(W, assignment; policy=:combined, cfg=cfg)
+            deadline = under(cfg, :deadline)
+            adaptive = under(cfg, :adaptive)
+            combined = under(cfg, :combined)
             push!(seed_scoring, adaptive.loss_fraction - deadline.loss_fraction)
             push!(seed_delay, adaptive.p95_delay_ms - deadline.p95_delay_ms)
             push!(full_rate, combined.mean_codec_kbps >= 0.99 * cfg.codec_kbps)
         end
         for calls in 128:128:1024
             cfg = VoiceSimConfig(duration_s=5.0, calls_per_ap=calls, background_load=0.8)
-            deadline = simulate_voice(W, assignment; policy=:deadline, cfg=cfg)
+            deadline = under(cfg, :deadline)
             deadline.deadline_loss_fraction <= 0.01 && continue
-            combined = simulate_voice(W, assignment; policy=:combined, cfg=cfg)
+            combined = under(cfg, :combined)
             push!(seed_combined, deadline.loss_fraction - combined.loss_fraction)
             push!(seed_bitrate, deadline.mean_codec_kbps - combined.mean_codec_kbps)
         end

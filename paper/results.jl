@@ -2,8 +2,6 @@ using WiFiAssignment, Random, Statistics, Printf
 const WA = WiFiAssignment
 include(joinpath(@__DIR__, "..", "benchmarks", "voice.jl"))
 
-# Regenerates every table, plot series and quoted number in results.tex and model.tex:
-#   julia -t 16 --project=benchmarks paper/results.jl
 const OUT = joinpath(@__DIR__, "generated")
 const NUMBERS = String[]
 const MAX_CONTENDERS = Ref(0)
@@ -28,25 +26,25 @@ function series!(name, header, rows)
     end
 end
 
-world(n, cpa, k, seed, demand) = make_world(n=n, cpa=cpa, seed=seed,
-    cfg=SimConfig(k_channels=k, area=100.0 * sqrt(n / 18), shadow_sigma=8.0, min_rate=0.001, demand_mbps=demand))
+quality_config(n, k, demand) =
+    SimConfig(k_channels=k, area=100.0 * sqrt(n / 18), shadow_sigma=8.0, min_rate=0.001, demand_mbps=demand)
 
 const METHODS = [
     "Graph colouring" => (W, s) -> naive_coloring(W),
     "Greedy, single pass (original)" => (W, s) -> greedy_rate(W; refine=false),
     "Greedy with local search" => (W, s) -> greedy_rate(W),
     "Annealing, fixed \$T_0 = 5\$, no polish" =>
-        (W, s) -> simulated_annealing(W; seed=s, iters=50_000, T0=5.0, polish=false)[1],
-    "Annealing, calibrated \$T_0\$, polish" => (W, s) -> simulated_annealing(W; seed=s, iters=50_000)[1],
+        (W, s) -> simulated_annealing(W; seed=s, cfg=AnnealConfig(iters=50_000, T0=5.0, polish=false))[1],
+    "Annealing, calibrated \$T_0\$, polish" => (W, s) -> simulated_annealing(W; seed=s, cfg=AnnealConfig(iters=50_000))[1],
     "\\texttt{optimize\\_assignment}" => (W, s) -> optimize_assignment(W; seed=s)[1]]
 
 function assignment_quality()
     regimes = [("2", 2, 40.0, 1:10), ("3", 3, 40.0, 1:10), ("4", 4, 40.0, 1:10), ("6", 6, 40.0, 1:10),
                ("3, light", 3, 3.0, 1:5)]
-    foreach(((_, f),) -> f(world(6, 2, 3, 1, 40.0), 1), METHODS)
+    foreach(((_, f),) -> f(make_world(n=6, cpa=2, seed=1, cfg=quality_config(6, 3, 40.0)), 1), METHODS)
     gaps = [Float64[] for _ in METHODS, _ in regimes]
     for (r, (_, k, demand, seeds)) in enumerate(regimes), n in (10, 14, 18), cpa in (4, 16), seed in seeds
-        W = world(n, cpa, k, seed, demand)
+        W = make_world(n=n, cpa=cpa, seed=seed, cfg=quality_config(n, k, demand))
         optimum = brute_force_fast(W)[2]
         for (m, (_, f)) in enumerate(METHODS)
             push!(gaps[m, r], max(optimum - total_score(W, f(W, seed)), 0.0))
@@ -63,7 +61,6 @@ function assignment_quality()
     number!("greedyPlainWorstGap", fmt(maximum(reduce(vcat, gaps[2, :]))))
 end
 
-# The original subset table: one pass over all 2^n masks per client with prefix recurrences.
 function original_subset_scores(W)
     count = 1 << W.n
     scores, interference, blockers = zeros(count), Vector{Float64}(undef, count), Vector{Float64}(undef, count)
@@ -91,7 +88,7 @@ function speed()
     rows, deviation = [], 0.0
     voice = VoiceSimConfig(calls_per_ap=64, background_load=0.75)
     for (regime, demand) in (("heavy", 40.0), ("light", 3.0)), n in (12, 14, 16, 18)
-        W = world(n, 16, 3, 1, demand)
+        W = make_world(n=n, cpa=16, seed=1, cfg=quality_config(n, 3, demand))
         saturated = all(>=(1.0), W.ap_activity)
         original = saturated ? med(() -> original_subset_scores(W), 3) : NaN
         saturated && (deviation = max(deviation, maximum(abs.(original_subset_scores(W) .- WA.subset_scores(W)))))
@@ -158,9 +155,9 @@ function estimate_accuracy()
             for seed in 1:10
                 W = make_world(seed=seed, cfg=SimConfig(k_channels=3, area=sc.area), n=sc.aps, cpa=sc.stations)
                 for assign in (greedy_rate(W), rand(Xoshiro(seed), 1:3, sc.aps))
-                    cfg = VoiceSimConfig(duration_s=20.0, calls_per_ap=sc.calls, background_load=sc.load)
-                    bitrate, delivered = WA.voice_steady_state(W, assign, WA.activity(W, assign), cfg, policy)
-                    r = simulate_voice(W, assign; policy=policy, cfg=cfg)
+                    cfg = VoiceSimConfig(duration_s=20.0, calls_per_ap=sc.calls, background_load=sc.load, policy=policy)
+                    bitrate, delivered = WA.voice_steady_state(WA.VoiceModel(W, cfg), assign, WA.activity(W, assign))
+                    r = simulate_voice(W, assign; cfg=cfg)
                     loss_err = max(loss_err, abs(1 - mean(delivered) - r.loss_fraction))
                     codec_err = max(codec_err, abs(mean(bitrate) - r.mean_codec_kbps))
                 end
@@ -201,10 +198,11 @@ function voice_objective_exactness()
     worst, cases = 0.0, 0
     for seed in 1:10, policy in POLICIES, (calls, load) in ((128, 0.8), (32, 1.05))
         W = make_world(n=7, cpa=4, seed=seed, cfg=SimConfig(k_channels=3, area=60.0))
-        cfg = VoiceSimConfig(calls_per_ap=calls, background_load=load)
-        objective(a) = total_score(W, a) + WA.voice_utility(W, a, WA.activity(W, a), cfg, policy)
+        cfg = VoiceSimConfig(calls_per_ap=calls, background_load=load, policy=policy)
+        model = WA.VoiceModel(W, cfg)
+        objective(a) = total_score(W, a) + WA.voice_utility(model, a, WA.activity(W, a))
         best = maximum(objective(digits(code; base=3, pad=7) .+ 1) for code in 0:(3^7 - 1))
-        found, score = optimize_assignment(W; seed=seed, voice=cfg, policy=policy)
+        found, score = optimize_assignment(W; seed=seed, voice=cfg)
         worst = max(worst, abs(score - best), best - objective(found))
         cases += 1
     end
@@ -246,10 +244,10 @@ function voice_aware()
     for sc in SCENARIOS, p in POLICIES
         before, after, better, worse, cost = Float64[], Float64[], 0, 0, Float64[]
         for seed in 1:20
-            W, cfg = scenario_world(sc, seed), scenario_voice(sc)
+            W, cfg = scenario_world(sc, seed), VoiceSimConfig(scenario_voice(sc); policy=p)
             plain = optimize_assignment(W; seed=seed)[1]
-            aware = optimize_assignment(W; seed=seed, voice=cfg, policy=p)[1]
-            r0, r1 = simulate_voice(W, plain; policy=p, cfg=cfg), simulate_voice(W, aware; policy=p, cfg=cfg)
+            aware = optimize_assignment(W; seed=seed, voice=cfg)[1]
+            r0, r1 = simulate_voice(W, plain; cfg=cfg), simulate_voice(W, aware; cfg=cfg)
             push!(before, r0.loss_fraction); push!(after, r1.loss_fraction)
             better += r1.delivered_mbps > r0.delivered_mbps * (1 + 1e-9)
             worse += r1.delivered_mbps < r0.delivered_mbps * (1 - 1e-9)

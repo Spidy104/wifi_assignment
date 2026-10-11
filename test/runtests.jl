@@ -16,18 +16,20 @@ end
 
 @testset "annealing and validation" begin
     W = make_world(n=8, cpa=2, seed=11)
-    best, score, history = simulated_annealing(W; seed=11, iters=300)
+    best, score, history = simulated_annealing(W; seed=11, cfg=AnnealConfig(iters=300))
     @test length(history) == 300
     @test isapprox(total_score(W, best), score; atol=1e-10)
     @test score >= maximum(history) - 1e-8
-    @test simulated_annealing(W; seed=11, iters=300)[1] == best
+    @test simulated_annealing(W; seed=11, cfg=AnnealConfig(iters=300))[1] == best
     @test_throws ArgumentError total_score(W, zeros(Int, W.n))
     @test_throws ArgumentError client_rates(W, [1])
-    @test_throws ArgumentError simulated_annealing(W; cooling=0)
+    @test_throws ArgumentError simulated_annealing(W; cfg=AnnealConfig(cooling=0))
+    @test_throws ArgumentError simulated_annealing(W; cfg=AnnealConfig(T0=0))
+    @test_throws ArgumentError simulated_annealing(W; cfg=AnnealConfig(iters=-1))
     @test_throws ArgumentError make_world(n=0)
 
     one_channel = make_world(cfg=SimConfig(k_channels=1), n=4, cpa=2, seed=2)
-    single, single_score, single_history = simulated_annealing(one_channel; iters=8)
+    single, single_score, single_history = simulated_annealing(one_channel; cfg=AnnealConfig(iters=8))
     @test single == ones(Int, 4)
     @test isapprox(total_score(one_channel, single), single_score; atol=1e-10)
     @test all(==(single_score), single_history)
@@ -44,8 +46,8 @@ end
         @test isapprox(total_score(W, best), score; atol=1e-10)
         @test optimize_assignment(W; seed=seed)[1] == best
 
-        polished = simulated_annealing(W; seed=seed, iters=200)[2]
-        unpolished = simulated_annealing(W; seed=seed, iters=200, polish=false)[2]
+        polished = simulated_annealing(W; seed=seed, cfg=AnnealConfig(iters=200))[2]
+        unpolished = simulated_annealing(W; seed=seed, cfg=AnnealConfig(iters=200, polish=false))[2]
         @test polished >= unpolished - 1e-10
     end
     W = make_world(n=6, cpa=2, seed=4, cfg=SimConfig(k_channels=5))
@@ -56,12 +58,23 @@ end
         @test exact_score ≈ best && total_score(W, exact) ≈ best
         @test found_score ≈ best && total_score(W, found) ≈ best
         @test all(<=(k), exact) && all(<=(k), found) && all(<=(k), greedy_rate(W; k=k)) &&
-              all(<=(k), simulated_annealing(W; k=k, iters=100)[1])
+              all(<=(k), simulated_annealing(W; k=k, cfg=AnnealConfig(iters=100))[1])
     end
     W = make_world(n=1, cpa=2, seed=1)
     @test optimize_assignment(W)[2] ≈ brute_force_fast(W)[2]
-    @test_throws ArgumentError optimize_assignment(W; restarts=0)
     @test_throws ArgumentError optimize_assignment(W; k=0)
+
+    many = make_world(n=5, cpa=3, seed=1, cfg=SimConfig(k_channels=18))
+    for found in (optimize_assignment(many; seed=3)[1], simulated_annealing(many; seed=3)[1],
+                  brute_force_fast(many; k=4)[1], greedy_rate(many))
+        @test found[1] == 1 && all(found[ap] <= maximum(found[1:(ap - 1)]) + 1 for ap in 2:5)
+    end
+
+    for noise in (100.0, 150.0, 250.0)
+        W = make_world(n=8, cpa=16, seed=8, cfg=SimConfig(min_rate=1e-25, noise_dbm=noise))
+        exact, exact_score = brute_force_fast(W)
+        @test isfinite(exact_score) && isapprox(exact_score, total_score(W, exact); rtol=1e-12)
+    end
 end
 @testset "airtime, carrier sense, and hidden transmitters" begin
     common = (k_channels=2, area=1.0, shadow_sigma=0.0, noise_dbm=-95.0,
@@ -135,8 +148,7 @@ end
     @test all(r -> r.p95_delay_ms <= 150.0, (light..., congested..., voice_heavy...))
 
     calls_256(seconds, load, policy) = simulate_voice(
-        W, assignment; policy=policy,
-        cfg=VoiceSimConfig(duration_s=seconds, background_load=load, calls_per_ap=256))
+        W, assignment; cfg=VoiceSimConfig(duration_s=seconds, background_load=load, calls_per_ap=256, policy=policy))
     @test light[3].mean_codec_kbps >= 0.99 * 64.0
     @test calls_256(2.0, 0.95, :adaptive).mean_codec_kbps <
           calls_256(2.0, 0.2, :adaptive).mean_codec_kbps
@@ -145,8 +157,7 @@ end
 
     isolated = make_world(n=2, cpa=1, seed=3, cfg=SimConfig(k_channels=2))
     no_collision = simulate_voice(
-        isolated, [1, 2]; policy=:deadline,
-        cfg=VoiceSimConfig(duration_s=0.02, calls_per_ap=1, background_load=0.0))
+        isolated, [1, 2]; cfg=VoiceSimConfig(duration_s=0.02, calls_per_ap=1, background_load=0.0, policy=:deadline))
     @test no_collision.retry_loss_fraction == 0.0
     @test isapprox(no_collision.delivered_packets, no_collision.packets; atol=1e-10)
 
@@ -159,32 +170,44 @@ end
     for (area, collides) in ((1.0, true), (10_000.0, false))
         pair = make_world(n=2, cpa=4, seed=3,
                           cfg=SimConfig(k_channels=1, area=area, cca_dbm=100.0, shadow_sigma=0.0))
-        result = simulate_voice(pair, [1, 1]; policy=:deadline,
-                                cfg=VoiceSimConfig(duration_s=0.2, calls_per_ap=1, background_load=0.5))
+        result = simulate_voice(pair, [1, 1];
+                                cfg=VoiceSimConfig(duration_s=0.2, calls_per_ap=1, background_load=0.5, policy=:deadline))
         @test (result.retry_loss_fraction > 0) == collides
     end
-    @test_throws ArgumentError simulate_voice(W, assignment; policy=:unknown)
+    @test VoiceSimConfig(VoiceSimConfig(calls_per_ap=7); policy=:fifo) == VoiceSimConfig(calls_per_ap=7, policy=:fifo)
+    @test_throws ArgumentError VoiceSimConfig(VoiceSimConfig(); polcy=:fifo)
+    @test_throws ArgumentError simulate_voice(W, assignment; cfg=VoiceSimConfig(policy=:unknown))
     @test_throws ArgumentError simulate_voice(
         W, assignment; cfg=VoiceSimConfig(min_codec_kbps=65.0))
 end
 
 @testset "voice-aware assignment" begin
-    cfg = VoiceSimConfig(calls_per_ap=128, background_load=0.8)
     for seed in 1:3, policy in (:fifo, :deadline, :adaptive, :combined)
+        cfg = VoiceSimConfig(calls_per_ap=128, background_load=0.8, policy=policy)
         W = make_world(n=6, cpa=4, seed=seed, cfg=SimConfig(area=60.0))
-        voice(a) = WiFiAssignment.voice_utility(W, a, WiFiAssignment.activity(W, a), cfg, policy)
-        table = WiFiAssignment.voice_subset_scores(W, cfg, policy)
+        model = WiFiAssignment.VoiceModel(W, cfg)
+        voice(a) = WiFiAssignment.voice_utility(model, a, WiFiAssignment.activity(W, a))
+        table = WiFiAssignment.voice_subset_scores(W, cfg)
         assignments = [digits(code; base=3, pad=6) .+ 1 for code in 0:(3^6 - 1)]
         @test all(assignments) do a
             masks = WiFiAssignment.channel_masks(a, 3)
             isapprox(sum(table[m + 1] for m in masks), voice(a); atol=1e-9)
         end
         best = maximum(a -> total_score(W, a) + voice(a), assignments)
-        found, score = optimize_assignment(W; seed=seed, voice=cfg, policy=policy)
+        found, score = optimize_assignment(W; seed=seed, voice=cfg)
         @test isapprox(score, best; atol=1e-9)
         @test isapprox(total_score(W, found) + voice(found), best; atol=1e-9)
     end
     W = make_world(n=4, cpa=2, seed=1)
-    @test_throws ArgumentError optimize_assignment(W; voice=cfg, policy=:unknown)
+    @test_throws ArgumentError optimize_assignment(W; voice=VoiceSimConfig(policy=:unknown))
     @test_throws ArgumentError optimize_assignment(W; voice=VoiceSimConfig(min_codec_kbps=65.0))
+end
+
+@testset "subset tables reuse their buffers" begin
+    W = make_world(n=14, cpa=4, seed=3, cfg=SimConfig(demand_mbps=3.0))
+    cfg = VoiceSimConfig(calls_per_ap=64, background_load=0.75)
+    WiFiAssignment.subset_scores(W)
+    WiFiAssignment.voice_subset_scores(W, cfg)
+    @test @allocated(WiFiAssignment.subset_scores(W)) < 400_000
+    @test @allocated(WiFiAssignment.voice_subset_scores(W, cfg)) < 400_000
 end

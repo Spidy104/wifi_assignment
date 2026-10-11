@@ -11,7 +11,6 @@ function reference_phy(W::World, c::Int, assign, act)
     return min(W.cfg.max_phy_mbps, W.cfg.bw_mhz * log2(1 + 10.0^(W.C_AP[c, own] / 10.0) / interference))
 end
 
-# Jacobi iteration of the airtime fixed point; channel 0 marks an absent AP.
 function reference_activity(W::World, assign)
     need(ap, channels, act) = min(1.0, sum(W.cfg.demand_mbps /
                                            (W.cfg.mac_efficiency * max(reference_phy(W, c, channels, act), W.cfg.min_rate))
@@ -133,7 +132,7 @@ function run_checks()
             coloring = naive_coloring(W; thresh=(-110.0, -80.0, -40.0)[seed])
             greedy = greedy_rate(W)
             annealed, annealed_score, history = simulated_annealing(
-                W; seed=1000 + seed, iters=12_000, T0=5.0, cooling=0.9995)
+                W; seed=1000 + seed, cfg=AnnealConfig(iters=12_000, T0=5.0, cooling=0.9995))
             check_assignment(W, coloring)
             check_assignment(W, greedy)
             @test isapprox(check_assignment(W, annealed), annealed_score; atol=1e-8)
@@ -163,8 +162,8 @@ function run_checks()
         @test all(isapprox.(client_rates(W, assign), client_rates(shifted, assign);
                             atol=1e-9, rtol=1e-11))
         @test isapprox(total_score(W, assign), total_score(shifted, assign); atol=1e-9)
-        @test simulated_annealing(W; seed=88, iters=20_000)[1] ==
-              simulated_annealing(W; seed=88, iters=20_000)[1]
+        @test simulated_annealing(W; seed=88, cfg=AnnealConfig(iters=20_000))[1] ==
+              simulated_annealing(W; seed=88, cfg=AnnealConfig(iters=20_000))[1]
         @test_throws ArgumentError total_score(W, [1])
         @test_throws ArgumentError total_score(W, zeros(Int, W.n))
         @test_throws ArgumentError total_score(W, fill(4, W.n))
@@ -172,9 +171,9 @@ function run_checks()
         @test_throws BoundsError client_rate(W, length(W.client_ap) + 1, assign)
         @test_throws ArgumentError greedy_rate(W; k=0)
         @test_throws ArgumentError simulated_annealing(W; k=4)
-        @test_throws ArgumentError simulated_annealing(W; iters=-1)
-        @test_throws ArgumentError simulated_annealing(W; T0=0)
-        @test_throws ArgumentError simulated_annealing(W; cooling=1.1)
+        @test_throws ArgumentError simulated_annealing(W; cfg=AnnealConfig(iters=-1))
+        @test_throws ArgumentError simulated_annealing(W; cfg=AnnealConfig(T0=0))
+        @test_throws ArgumentError simulated_annealing(W; cfg=AnnealConfig(cooling=1.1))
         @test_throws ArgumentError brute_force_naive(make_world(n=13, cpa=1, seed=1))
         @test_throws ArgumentError make_world(n=19)
         @test_throws ArgumentError make_world(cpa=0)
@@ -253,9 +252,10 @@ function run_checks()
             seed in 1:3, policy in (:fifo, :deadline, :adaptive, :combined)
             W = make_world(seed=seed, cfg=SimConfig(k_channels=3, area=area), n=n, cpa=cpa)
             assign = rand(Xoshiro(seed), 1:3, n)
-            cfg = VoiceSimConfig(duration_s=20.0, calls_per_ap=calls, background_load=load)
-            bitrate, delivered = WiFiAssignment.voice_steady_state(W, assign, WiFiAssignment.activity(W, assign), cfg, policy)
-            r = simulate_voice(W, assign; policy=policy, cfg=cfg)
+            cfg = VoiceSimConfig(duration_s=20.0, calls_per_ap=calls, background_load=load, policy=policy)
+            model = WiFiAssignment.VoiceModel(W, cfg)
+            bitrate, delivered = WiFiAssignment.voice_steady_state(model, assign, WiFiAssignment.activity(W, assign))
+            r = simulate_voice(W, assign; cfg=cfg)
             @test isapprox(1 - mean(delivered), r.loss_fraction; atol=0.006)
             @test isapprox(mean(bitrate), r.mean_codec_kbps; atol=0.15)
         end
@@ -311,7 +311,7 @@ function run_benchmarks()
         @test hot[1] == 0 && hot[2] < 1024
         cases = (("subset scores", () -> WiFiAssignment.subset_scores(W)),
                  ("greedy", () -> greedy_rate(W)),
-                 ("anneal 30k", () -> simulated_annealing(W; seed=1, iters=30_000)))
+                 ("anneal 30k", () -> simulated_annealing(W; seed=1, cfg=AnnealConfig(iters=30_000))))
         for (label, f) in cases
             milliseconds, bytes = measure(f, n >= 16 ? 3 : 5)
             @printf("%-5d %-16s %12.3f %14.1f\n", n, label, milliseconds, bytes / 1024)
@@ -326,10 +326,11 @@ function run_benchmarks()
     end
 
     W = make_world(n=10, cpa=4, seed=2026)
-    simulated_annealing(W; seed=7, iters=0)
-    simulated_annealing(W; seed=7, iters=100_000)
-    baseline = @allocated simulated_annealing(W; seed=7, iters=0)
-    extended = @allocated simulated_annealing(W; seed=7, iters=100_000)
+    none, long = AnnealConfig(iters=0), AnnealConfig(iters=100_000)
+    simulated_annealing(W; seed=7, cfg=none)
+    simulated_annealing(W; seed=7, cfg=long)
+    baseline = @allocated simulated_annealing(W; seed=7, cfg=none)
+    extended = @allocated simulated_annealing(W; seed=7, cfg=long)
     delta = extended - baseline
     @printf("SA extra allocation over 100,000 steps: %d bytes (history alone: 800,000 bytes)\n", delta)
 end

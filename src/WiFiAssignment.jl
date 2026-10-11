@@ -4,8 +4,8 @@ using Random
 using Base: @kwdef
 
 export SimConfig, World, make_world, client_rate, client_rates, total_score,
-       naive_coloring, greedy_rate, simulated_annealing, optimize_assignment, brute_force_fast,
-       brute_force_naive, VoiceSimConfig, VoiceResult, simulate_voice,
+       naive_coloring, greedy_rate, AnnealConfig, simulated_annealing, optimize_assignment,
+       brute_force_fast, brute_force_naive, VoiceSimConfig, VoiceResult, simulate_voice,
        compare_voice_strategies
 
 @kwdef struct SimConfig
@@ -40,6 +40,8 @@ struct World
     ap_activity::Vector{Float64}
 end
 
+const POLICIES = (:fifo, :deadline, :adaptive, :combined)
+
 @kwdef struct VoiceSimConfig
     duration_s::Float64 = 20.0
     frame_ms::Float64 = 20.0
@@ -51,6 +53,21 @@ end
     background_load::Float64 = 0.95
     retry_limit::Int = 2
     adaptation_speed::Float64 = 0.35
+    policy::Symbol = :combined
+end
+
+function VoiceSimConfig(cfg::VoiceSimConfig; changes...)
+    for name in keys(changes)
+        hasfield(VoiceSimConfig, name) || throw(ArgumentError("VoiceSimConfig has no field $name"))
+    end
+    return VoiceSimConfig(; (f => getfield(cfg, f) for f in fieldnames(VoiceSimConfig))..., changes...)
+end
+
+@kwdef struct AnnealConfig
+    iters::Int = 3000
+    T0::Union{Nothing,Float64} = nothing
+    cooling::Union{Nothing,Float64} = nothing
+    polish::Bool = true
 end
 
 struct VoiceResult
@@ -66,15 +83,12 @@ struct VoiceResult
     delivered_mbps::Float64
 end
 
-# 802.11 OFDM PHY backoff: CWmin 15 (16 slots) doubling over 6 stages to CWmax 1023.
 const CW_MIN = 16
 const BACKOFF_STAGES = 6
-# A hidden AP only destroys a frame it reaches within this margin of the wanted signal (ns-2 CPThresh).
 const CAPTURE_DB = 10.0
+const RESTARTS = 8
+const KICKS = 200
 
-# Bianchi's DCF fixed point: per-attempt collision probability among `n` saturated contenders
-# (fractional when contenders are only partly busy). f(p) = p - 1 + (1 - τ(p))^(n-1) is increasing,
-# so a Newton step that leaves the bracket falls back to bisection.
 function dcf_collision(n::Float64)
     n <= 1.0 && return 0.0
     lo, hi, p = 0.0, 1.0, 0.5
@@ -99,8 +113,6 @@ function dcf_collision(n::Float64)
     error("Bianchi collision fixed point did not converge for $n contenders")
 end
 
-# Probability a frame overlaps one hidden transmitter that is busy a fraction `u` of the time with
-# frames as long as ours and exponential idle gaps: busy at the start, or starting during the frame.
 hidden_collision(u::Float64) = u + (1 - u) * -expm1(-u / (1 - u))
 
 struct QueuedWork
@@ -194,12 +206,8 @@ function validate_k(W::World, k::Integer)
     1 <= k <= W.cfg.k_channels || throw(ArgumentError("channel count must be within 1:$(W.cfg.k_channels)"))
 end
 
-# Airtime each AP needs for its clients' demand once hidden co-channel APs interfere in
-# proportion to their own airtime. The map is monotone, so iterating from the
-# interference-free activity reaches the least fixed point. Channel 0 marks an absent AP.
-function activity(W::World, assign::AbstractVector{<:Integer})
-    all(>=(1.0), W.ap_activity) && return W.ap_activity
-    act = copy(W.ap_activity)
+function activity!(act::AbstractVector{Float64}, W::World, assign::AbstractVector{<:Integer})
+    copyto!(act, W.ap_activity)
     for _ in 1:1000
         change = 0.0
         @inbounds for ap in 1:W.n
@@ -223,6 +231,9 @@ function activity(W::World, assign::AbstractVector{<:Integer})
     end
     error("airtime fixed point did not converge")
 end
+
+activity(W::World, assign::AbstractVector{<:Integer}) =
+    all(>=(1.0), W.ap_activity) ? W.ap_activity : activity!(similar(W.ap_activity), W, assign)
 
 @inline function rate_unchecked(W::World, c::Int, assign::AbstractVector{<:Integer},
                                 act::AbstractVector{Float64})
@@ -268,7 +279,12 @@ function validate_voice_config(cfg::VoiceSimConfig)
     isfinite(cfg.background_load) && cfg.background_load >= 0 || throw(ArgumentError("background load must be nonnegative and finite"))
     cfg.retry_limit >= 0 || throw(ArgumentError("retry limit must be nonnegative"))
     isfinite(cfg.adaptation_speed) && 0 < cfg.adaptation_speed <= 1 || throw(ArgumentError("adaptation speed must be within (0, 1]"))
+    cfg.policy in POLICIES || throw(ArgumentError("voice policy must be :fifo, :deadline, :adaptive, or :combined"))
 end
+
+prioritized(cfg::VoiceSimConfig) = cfg.policy in (:deadline, :combined)
+adaptive(cfg::VoiceSimConfig) = cfg.policy in (:adaptive, :combined)
+packet_bits(cfg::VoiceSimConfig, kbps::Float64) = kbps * cfg.frame_ms + 8.0 * cfg.packet_overhead_bytes
 
 function voice_ap_capacity(W::World, assign::AbstractVector{<:Integer})
     capacity = zeros(W.n)
@@ -279,8 +295,6 @@ function voice_ap_capacity(W::World, assign::AbstractVector{<:Integer})
     return capacity
 end
 
-# Which APs carrier-sense each other, and the share of AP i's clients that AP j reaches within the
-# capture margin (so a hidden j corrupts their frames). Neither depends on the channel assignment.
 function mac_tables(W::World)
     capture = 10.0^(CAPTURE_DB / 10.0)
     clients(i) = ((i - 1) * W.clients_per_ap + 1):(i * W.clients_per_ap)
@@ -290,8 +304,6 @@ function mac_tables(W::World)
     return sensed, share
 end
 
-# Airtime of the sensed co-channel APs (Bianchi contenders beyond `ap` itself) and the probability
-# that no hidden co-channel AP overlaps `ap`'s frame.
 function mac_exposure(assign, ap, utilization, (sensed, share))
     sensed_load, clear = 0.0, 1.0
     @inbounds for j in eachindex(assign)
@@ -305,34 +317,47 @@ function mac_exposure(assign, ap, utilization, (sensed, share))
     return 1.0 + sensed_load, clear
 end
 
-function validate_policy(policy::Symbol)
-    policy in (:fifo, :deadline, :adaptive, :combined) ||
-        throw(ArgumentError("voice policy must be :fifo, :deadline, :adaptive, or :combined"))
+struct VoiceModel
+    W::World
+    cfg::VoiceSimConfig
+    mac::Tuple{Matrix{Bool},Matrix{Float64}}
 end
 
-# Steady state of `simulate_voice` for the present APs: utilization, collisions and the codec target are
-# iterated to their joint fixed point (where each codec equals its target), halving the step whenever
-# it stops contracting. Returns each present AP's codec rate and the fraction of its packets delivered.
-function voice_steady_state(W::World, assign, act, cfg::VoiceSimConfig, policy::Symbol, mac=mac_tables(W))
-    members = [ap for ap in 1:W.n if assign[ap] != 0]
-    raw = zeros(W.n)
+VoiceModel(W::World, cfg::VoiceSimConfig) = VoiceModel(W, cfg, mac_tables(W))
+
+struct VoiceWork
+    raw::Vector{Float64}
+    bitrate::Vector{Float64}
+    utilization::Vector{Float64}
+    service::Vector{Float64}
+    residual::Vector{Float64}
+    contenders::Vector{Float64}
+    contention::Vector{Float64}
+end
+
+VoiceWork(n::Int) = VoiceWork((zeros(n) for _ in 1:7)...)
+
+function voice_steady_state!(work::VoiceWork, model::VoiceModel, assign, act)
+    (; W, cfg, mac) = model
+    (; raw, bitrate, utilization, service, residual, contenders, contention) = work
+    fill!(raw, 0.0)
     for c in eachindex(W.client_ap)
         ap = W.client_ap[c]
         assign[ap] != 0 && (raw[ap] += rate_unchecked(W, c, assign, act) * 1000.0 * cfg.frame_ms)
     end
     flows = 2 * cfg.calls_per_ap
-    overhead = 8.0 * cfg.packet_overhead_bytes
-    background = policy in (:deadline, :combined) ? 0.0 : cfg.background_load
-    bitrate = fill(cfg.codec_kbps, W.n)
-    utilization, service, residual = zeros(W.n), zeros(W.n), zeros(W.n)
-    contenders, contention = fill(NaN, W.n), zeros(W.n)
-    damping, previous, converged = 1.0, Inf, false
+    background = prioritized(cfg) ? 0.0 : cfg.background_load
+    fill!(bitrate, cfg.codec_kbps)
+    fill!(contenders, NaN)
+    damping, previous = 1.0, Inf
     for _ in 1:10_000
-        for ap in members
-            utilization[ap] = min(1.0, cfg.background_load + flows * (bitrate[ap] * cfg.frame_ms + overhead) / raw[ap])
+        for ap in 1:W.n
+            assign[ap] == 0 && continue
+            utilization[ap] = min(1.0, cfg.background_load + flows * packet_bits(cfg, bitrate[ap]) / raw[ap])
         end
         change = 0.0
-        for ap in members
+        for ap in 1:W.n
+            assign[ap] == 0 && continue
             n_contenders, clear = mac_exposure(assign, ap, utilization, mac)
             if n_contenders != contenders[ap]
                 contenders[ap] = n_contenders
@@ -341,37 +366,68 @@ function voice_steady_state(W::World, assign, act, cfg::VoiceSimConfig, policy::
             collision = 1.0 - (1.0 - contention[ap]) * clear
             service[ap] = raw[ap] / sum(collision^i for i in 0:cfg.retry_limit)
             residual[ap] = collision^(cfg.retry_limit + 1)
-            if policy in (:adaptive, :combined)
-                target = clamp((max(service[ap] - background * raw[ap], 0.0) / flows - overhead) / cfg.frame_ms,
+            if adaptive(cfg)
+                target = clamp((max(service[ap] - background * raw[ap], 0.0) / flows -
+                                8.0 * cfg.packet_overhead_bytes) / cfg.frame_ms,
                                cfg.min_codec_kbps, cfg.codec_kbps)
                 change = max(change, abs(target - bitrate[ap]))
                 bitrate[ap] += damping * (target - bitrate[ap])
             end
         end
-        converged = change < 1e-12
-        converged && break
+        change < 1e-12 && return work
         change >= previous && (damping /= 2)
         previous = change
     end
-    converged || error("voice steady state did not converge")
-    delivered = [min(1.0, service[ap] / (flows * (bitrate[ap] * cfg.frame_ms + overhead) + background * raw[ap])) *
-                 (1.0 - residual[ap]) for ap in members]
-    return bitrate[members], delivered
+    error("voice steady state did not converge")
 end
 
-# Each voice flow contributes log(delivered codec rate / nominal rate), so codec quality and loss both count.
-function voice_utility(W::World, assign, act, cfg::VoiceSimConfig, policy::Symbol, mac=mac_tables(W))
-    bitrate, delivered = voice_steady_state(W, assign, act, cfg, policy, mac)
-    return 2 * cfg.calls_per_ap *
-           sum(log(max(r / cfg.codec_kbps * d, floatmin(Float64))) for (r, d) in zip(bitrate, delivered); init=0.0)
+function delivered_fraction(work::VoiceWork, model::VoiceModel, ap::Int)
+    cfg = model.cfg
+    background = prioritized(cfg) ? 0.0 : cfg.background_load * work.raw[ap]
+    offered = 2 * cfg.calls_per_ap * packet_bits(cfg, work.bitrate[ap]) + background
+    return min(1.0, work.service[ap] / offered) * (1.0 - work.residual[ap])
 end
 
-function voice_subset_scores(W::World, cfg::VoiceSimConfig, policy::Symbol)
+function voice_steady_state(model::VoiceModel, assign, act)
+    work = voice_steady_state!(VoiceWork(model.W.n), model, assign, act)
+    members = filter(ap -> assign[ap] != 0, 1:model.W.n)
+    return work.bitrate[members], [delivered_fraction(work, model, ap) for ap in members]
+end
+
+function voice_utility(model::VoiceModel, work::VoiceWork, assign, act)
+    voice_steady_state!(work, model, assign, act)
+    total = 0.0
+    for ap in 1:model.W.n
+        assign[ap] == 0 && continue
+        quality = work.bitrate[ap] / model.cfg.codec_kbps * delivered_fraction(work, model, ap)
+        total += log(max(quality, floatmin(Float64)))
+    end
+    return 2 * model.cfg.calls_per_ap * total
+end
+
+voice_utility(model::VoiceModel, assign, act) = voice_utility(model, VoiceWork(model.W.n), assign, act)
+
+function subset_chunks(n::Int)
+    masks = 1:((1 << n) - 1)
+    return collect(Iterators.partition(masks, max(64, cld(length(masks), 8 * Threads.nthreads()))))
+end
+
+function mask_assign!(assign::Vector{Int}, mask::Int)
+    for ap in eachindex(assign)
+        assign[ap] = (mask >> (ap - 1)) & 1
+    end
+    return assign
+end
+
+function voice_subset_scores(W::World, cfg::VoiceSimConfig)
+    model = VoiceModel(W, cfg)
     scores = zeros(1 << W.n)
-    mac = mac_tables(W)
-    Threads.@threads :greedy for mask in 1:(length(scores) - 1)
-        assign = [(mask >> (ap - 1)) & 1 for ap in 1:W.n]
-        scores[mask + 1] = voice_utility(W, assign, activity(W, assign), cfg, policy, mac)
+    Threads.@threads :greedy for chunk in subset_chunks(W.n)
+        assign, act, work = zeros(Int, W.n), similar(W.ap_activity), VoiceWork(W.n)
+        for mask in chunk
+            activity!(act, W, mask_assign!(assign, mask))
+            scores[mask + 1] = voice_utility(model, work, assign, act)
+        end
     end
     return scores
 end
@@ -388,11 +444,9 @@ function weighted_quantile(values::Vector{Float64}, weights::Vector{Float64}, p:
     return values[order[end]]
 end
 
-function simulate_voice(W::World, assign::AbstractVector{<:Integer};
-                        policy::Symbol=:combined, cfg::VoiceSimConfig=VoiceSimConfig())
+function simulate_voice(W::World, assign::AbstractVector{<:Integer}; cfg::VoiceSimConfig=VoiceSimConfig())
     validate_assignment(W, assign)
     validate_voice_config(cfg)
-    validate_policy(policy)
     frames = max(1, round(Int, 1000 * cfg.duration_s / cfg.frame_ms))
     drain_frames = ceil(Int, cfg.deadline_ms / cfg.frame_ms)
     packets_per_frame = 2 * cfg.calls_per_ap
@@ -413,8 +467,6 @@ function simulate_voice(W::World, assign::AbstractVector{<:Integer};
     retry_lost = 0.0
     payload_delivered = 0.0
     codec_sum = 0.0
-    adaptive = policy in (:adaptive, :combined)
-    scored = policy in (:deadline, :combined)
     overhead_bits = 8.0 * cfg.packet_overhead_bytes
     service = zeros(W.n)
     residual_loss = zeros(W.n)
@@ -425,7 +477,7 @@ function simulate_voice(W::World, assign::AbstractVector{<:Integer};
         expiry_ms = start_ms + cfg.deadline_ms
         if step <= frames
             for ap in 1:W.n
-                voice_bits = packets_per_frame * (bitrate[ap] * cfg.frame_ms + overhead_bits)
+                voice_bits = packets_per_frame * packet_bits(cfg, bitrate[ap])
                 utilization[ap] = min(1.0, cfg.background_load + voice_bits / (capacity[ap] * 1000.0 * cfg.frame_ms))
             end
         end
@@ -434,7 +486,6 @@ function simulate_voice(W::World, assign::AbstractVector{<:Integer};
             raw_service = capacity[ap] * 1000.0 * cfg.frame_ms
             queue = queues[ap]
             if step <= frames
-                packet_bits = bitrate[ap] * cfg.frame_ms + overhead_bits
                 n_contenders, clear = mac_exposure(assign, ap, utilization, mac)
                 if n_contenders != contenders[ap]
                     contenders[ap] = n_contenders
@@ -444,19 +495,16 @@ function simulate_voice(W::World, assign::AbstractVector{<:Integer};
                 attempts = sum(collision^i for i in 0:cfg.retry_limit)
                 service[ap] = raw_service / attempts
                 residual_loss[ap] = collision^(cfg.retry_limit + 1)
-                background = scored ? 0.0 : cfg.background_load * raw_service
+                background = prioritized(cfg) ? 0.0 : cfg.background_load * raw_service
 
-                if adaptive
+                if adaptive(cfg)
                     available = max(service[ap] - background, 0.0)
                     target = clamp((available / packets_per_frame - overhead_bits) / cfg.frame_ms,
                                    cfg.min_codec_kbps, cfg.codec_kbps)
                     bitrate[ap] += cfg.adaptation_speed * (target - bitrate[ap])
-                    packet_bits = bitrate[ap] * cfg.frame_ms + overhead_bits
                 end
 
-                # Under FIFO the frame's voice and background interleave, so one item carries both
-                # and each voice packet accounts for its share of the mixed stream.
-                stream_bits = packets_per_frame * packet_bits + background
+                stream_bits = packets_per_frame * packet_bits(cfg, bitrate[ap]) + background
                 push!(queue, QueuedWork(stream_bits, stream_bits / packets_per_frame,
                                         bitrate[ap] * cfg.frame_ms, start_ms, expiry_ms))
                 codec_sum += bitrate[ap]
@@ -497,16 +545,13 @@ function simulate_voice(W::World, assign::AbstractVector{<:Integer};
     mean_codec = codec_sum / (frames * W.n)
     simulated_s = frames * cfg.frame_ms / 1000.0
     delivered_mbps = payload_delivered / (simulated_s * 1.0e6)
-    return VoiceResult(policy, total_packets, delivered, loss,
+    return VoiceResult(cfg.policy, total_packets, delivered, loss,
                        deadline_lost / total_packets, retry_lost / total_packets,
                        mean_delay, p95_delay, mean_codec, delivered_mbps)
 end
 
-function compare_voice_strategies(W::World, assign::AbstractVector{<:Integer};
-                                  cfg::VoiceSimConfig=VoiceSimConfig())
-    return [simulate_voice(W, assign; policy=policy, cfg=cfg)
-            for policy in (:fifo, :deadline, :adaptive, :combined)]
-end
+compare_voice_strategies(W::World, assign::AbstractVector{<:Integer}; cfg::VoiceSimConfig=VoiceSimConfig()) =
+    [simulate_voice(W, assign; cfg=VoiceSimConfig(cfg; policy)) for policy in POLICIES]
 
 function score_unchecked(W::World, assign::AbstractVector{<:Integer})
     act = activity(W, assign)
@@ -517,14 +562,18 @@ function score_unchecked(W::World, assign::AbstractVector{<:Integer})
     return score
 end
 
-# With unsaturated APs the airtime depends on the channel group, so each entry needs its own fixed point.
 function contended_subset_scores(W::World)
     scores = zeros(1 << W.n)
-    Threads.@threads :greedy for mask in 1:(length(scores) - 1)
-        assign = [(mask >> (ap - 1)) & 1 for ap in 1:W.n]
-        act = activity(W, assign)
-        scores[mask + 1] = sum(log(rate_unchecked(W, c, assign, act))
-                               for c in eachindex(W.client_ap) if assign[W.client_ap[c]] == 1)
+    Threads.@threads :greedy for chunk in subset_chunks(W.n)
+        assign, act = zeros(Int, W.n), similar(W.ap_activity)
+        for mask in chunk
+            activity!(act, W, mask_assign!(assign, mask))
+            score = 0.0
+            for c in eachindex(W.client_ap)
+                assign[W.client_ap[c]] == 1 && (score += log(rate_unchecked(W, c, assign, act)))
+            end
+            scores[mask + 1] = score
+        end
     end
     return scores
 end
@@ -542,10 +591,6 @@ function subset_sums(w::AbstractVector{Float64})
     return sums
 end
 
-# With every AP saturated, interference and blocked airtime add over APs, so each client needs only two
-# small subset-sum tables of interference (low and high halves of the mask) and each AP two of blocked
-# airtime; rows of the result are independent. Up to 16 client rates are multiplied before one log,
-# which stays in Float64 range while rates lie within 1e±19.
 function subset_scores(W::World)
     all(>=(1.0), W.ap_activity) || return contended_subset_scores(W)
     n = W.n
@@ -553,6 +598,8 @@ function subset_scores(W::World)
     lo_size = 1 << low
     scores = zeros(1 << n)
     clients = [findall(==(ap), W.client_ap) for ap in 1:n]
+    extreme = max(abs(log(min(W.cfg.min_rate, W.cfg.demand_mbps))), abs(log(W.cfg.demand_mbps)), 1.0)
+    group_size = clamp(floor(Int, 600 / extreme), 1, 16)
     sinr_cap = expm1(W.cfg.max_phy_mbps / W.rate_scale)
     sensed = [i != j && W.AP_AP[i, j] >= W.cfg.cca_dbm for i in 1:n, j in 1:n]
     blocked_tables = map(1:n) do own
@@ -574,7 +621,7 @@ function subset_scores(W::World)
             hi & own_hi == own_hi || continue
             blocked_lo, blocked_hi = blocked_tables[own]
             blocked = blocked_hi[hi + 1]
-            for group in Iterators.partition(clients[own], 16)
+            for group in Iterators.partition(clients[own], group_size)
                 fill!(product, 1.0)
                 for c in group
                     hidden_lo, hidden_hi = hidden_tables[c]
@@ -630,84 +677,108 @@ function channel_masks(assign, k)
     return masks
 end
 
-masks_score(scores, masks) = sum(mask -> scores[mask + 1], masks)
+struct Partition
+    assign::Vector{Int}
+    masks::Vector{Int}
+end
 
-@inline function move_delta(scores, masks, bit, from, to)
+Partition(assign::Vector{Int}, k::Integer) = Partition(assign, channel_masks(assign, k))
+
+function Base.copyto!(dst::Partition, src::Partition)
+    copyto!(dst.assign, src.assign)
+    copyto!(dst.masks, src.masks)
+    return dst
+end
+
+masks_score(scores, part::Partition) = sum(mask -> scores[mask + 1], part.masks)
+
+@inline function move_delta(scores, part::Partition, ap, to)
+    masks, bit, from = part.masks, 1 << (ap - 1), part.assign[ap]
     return scores[(masks[from] & ~bit) + 1] + scores[(masks[to] | bit) + 1] -
            scores[masks[from] + 1] - scores[masks[to] + 1]
 end
 
-@inline function swap_delta(scores, masks, bit_a, from, bit_b, to)
+@inline function swap_delta(scores, part::Partition, a, b)
+    masks, from, to = part.masks, part.assign[a], part.assign[b]
+    bit_a, bit_b = 1 << (a - 1), 1 << (b - 1)
     return scores[((masks[from] & ~bit_a) | bit_b) + 1] +
            scores[((masks[to] & ~bit_b) | bit_a) + 1] -
            scores[masks[from] + 1] - scores[masks[to] + 1]
 end
 
-function move!(assign, masks, ap, to)
+function move!(part::Partition, ap, to)
     bit = 1 << (ap - 1)
-    masks[assign[ap]] &= ~bit
-    masks[to] |= bit
-    assign[ap] = to
+    part.masks[part.assign[ap]] &= ~bit
+    part.masks[to] |= bit
+    part.assign[ap] = to
+    return part
 end
 
-other_channel(rng, old, k) = (new = rand(rng, 1:(k - 1)); new + (new >= old))
+function canonical!(assign::Vector{Int})
+    labels = zeros(Int, maximum(assign))
+    next = 0
+    for (ap, ch) in enumerate(assign)
+        labels[ch] == 0 && (labels[ch] = next += 1)
+        assign[ap] = labels[ch]
+    end
+    return assign
+end
 
-# Hill climb over single-AP moves and pairwise swaps until neither improves the score.
-function polish!(scores, assign, masks)
+other_channel(rng, old, k) =(new = rand(rng, 1:(k - 1)); new + (new >= old))
+
+function polish!(scores, part::Partition)
+    assign = part.assign
     improved = true
     while improved
         improved = false
-        for a in eachindex(assign), q in eachindex(masks)
-            p = assign[a]
-            if q != p && move_delta(scores, masks, 1 << (a - 1), p, q) > 1e-12
-                move!(assign, masks, a, q)
+        for a in eachindex(assign), q in eachindex(part.masks)
+            if q != assign[a] && move_delta(scores, part, a, q) > 1e-12
+                move!(part, a, q)
                 improved = true
             end
         end
         for a in eachindex(assign), b in (a + 1):length(assign)
             p, q = assign[a], assign[b]
-            if p != q && swap_delta(scores, masks, 1 << (a - 1), p, 1 << (b - 1), q) > 1e-12
-                move!(assign, masks, a, q)
-                move!(assign, masks, b, p)
+            if p != q && swap_delta(scores, part, a, b) > 1e-12
+                move!(part, a, q)
+                move!(part, b, p)
                 improved = true
             end
         end
     end
-    return assign
+    return part
 end
 
 interference_caused(W::World) =
     [sum(W.C_AP_mW[c, j] for c in eachindex(W.client_ap) if W.client_ap[c] != j; init=0.0)
      for j in 1:W.n]
 
-function greedy_fill!(assign, masks, scores, order)
+function greedy_fill!(part::Partition, scores, order)
+    masks = part.masks
     fill!(masks, 0)
     for ap in order
         bit = 1 << (ap - 1)
         ch = argmax(c -> scores[(masks[c] | bit) + 1] - scores[masks[c] + 1], eachindex(masks))
         masks[ch] |= bit
-        assign[ap] = ch
+        part.assign[ap] = ch
     end
-    return assign
+    return part
 end
 
 function greedy_rate(W::World; k::Integer=W.cfg.k_channels, refine::Bool=true)
     validate_k(W, k)
     scores = subset_scores(W)
-    assign = zeros(Int, W.n)
-    masks = zeros(Int, k)
-    greedy_fill!(assign, masks, scores, sortperm(interference_caused(W); rev=true))
-    refine && polish!(scores, assign, masks)
-    return assign
+    part = Partition(zeros(Int, W.n), zeros(Int, k))
+    greedy_fill!(part, scores, sortperm(interference_caused(W); rev=true))
+    refine && polish!(scores, part)
+    return canonical!(part.assign)
 end
 
-# Temperature at which an average downhill move from the starting point is accepted half the time.
-function initial_temperature(scores, assign, masks, rng)
+function initial_temperature(scores, part::Partition, rng)
     total, downhill = 0.0, 0
     for _ in 1:200
-        ap = rand(rng, eachindex(assign))
-        to = other_channel(rng, assign[ap], length(masks))
-        delta = move_delta(scores, masks, 1 << (ap - 1), assign[ap], to)
+        ap = rand(rng, eachindex(part.assign))
+        delta = move_delta(scores, part, ap, other_channel(rng, part.assign[ap], length(part.masks)))
         if delta < 0
             total -= delta
             downhill += 1
@@ -716,99 +787,86 @@ function initial_temperature(scores, assign, masks, rng)
     return downhill == 0 ? 1.0 : total / (downhill * log(2))
 end
 
-function simulated_annealing(W::World; k::Integer=W.cfg.k_channels,
-                             iters::Integer=3000, T0::Union{Nothing,Real}=nothing,
-                             cooling::Union{Nothing,Real}=nothing,
-                             seed::Union{Nothing,Integer}=nothing, polish::Bool=true)
+function simulated_annealing(W::World; k::Integer=W.cfg.k_channels, seed::Union{Nothing,Integer}=nothing,
+                             cfg::AnnealConfig=AnnealConfig())
     validate_k(W, k)
-    iters >= 0 || throw(ArgumentError("iteration count must be nonnegative"))
-    isnothing(T0) || isfinite(T0) && T0 > 0 ||
+    cfg.iters >= 0 || throw(ArgumentError("iteration count must be nonnegative"))
+    isnothing(cfg.T0) || isfinite(cfg.T0) && cfg.T0 > 0 ||
         throw(ArgumentError("initial temperature must be positive and finite"))
-    if !isnothing(cooling)
-        isfinite(cooling) && 0 < cooling <= 1 || throw(ArgumentError("cooling must be within (0, 1]"))
-    end
-    decay = isnothing(cooling) ? exp(log(0.01) / max(iters, 1)) : Float64(cooling)
+    isnothing(cfg.cooling) || isfinite(cfg.cooling) && 0 < cfg.cooling <= 1 ||
+        throw(ArgumentError("cooling must be within (0, 1]"))
+    decay = isnothing(cfg.cooling) ? exp(log(0.01) / max(cfg.iters, 1)) : cfg.cooling
     rng = isnothing(seed) ? Random.default_rng() : Xoshiro(seed)
     scores = subset_scores(W)
-    assign = rand(rng, 1:k, W.n)
-    masks = channel_masks(assign, k)
-    score = masks_score(scores, masks)
-    history = Vector{Float64}(undef, iters)
+    part = Partition(rand(rng, 1:k, W.n), k)
+    score = masks_score(scores, part)
+    history = Vector{Float64}(undef, cfg.iters)
 
     if k == 1
         fill!(history, score)
-        return assign, score, history
+        return part.assign, score, history
     end
 
-    best = copy(assign)
+    best = copy(part.assign)
     best_score = score
-    temperature = isnothing(T0) ? initial_temperature(scores, assign, masks, rng) : Float64(T0)
+    temperature = isnothing(cfg.T0) ? initial_temperature(scores, part, rng) : cfg.T0
     for step in eachindex(history)
         ap = rand(rng, 1:W.n)
-        to = other_channel(rng, assign[ap], k)
-        delta = move_delta(scores, masks, 1 << (ap - 1), assign[ap], to)
+        to = other_channel(rng, part.assign[ap], k)
+        delta = move_delta(scores, part, ap, to)
         if delta >= 0 || delta > -20temperature && rand(rng) < exp(delta / temperature)
-            move!(assign, masks, ap, to)
+            move!(part, ap, to)
             score += delta
             if score > best_score
                 best_score = score
-                copyto!(best, assign)
+                copyto!(best, part.assign)
             end
         end
         history[step] = score
         temperature *= decay
     end
-    polish && polish!(scores, best, channel_masks(best, k))
-    return best, total_score(W, best), history
+    cfg.polish && polish!(scores, Partition(best, k))
+    return canonical!(best), total_score(W, best), history
 end
 
-# With `voice`, every voice flow joins the clients in the proportional-fair objective (see `voice_utility`).
-function optimize_assignment(W::World; k::Integer=W.cfg.k_channels, restarts::Integer=8,
-                             kicks::Integer=200, seed::Union{Nothing,Integer}=nothing,
-                             voice::Union{Nothing,VoiceSimConfig}=nothing, policy::Symbol=:combined)
+function optimize_assignment(W::World; k::Integer=W.cfg.k_channels, seed::Union{Nothing,Integer}=nothing,
+                             voice::Union{Nothing,VoiceSimConfig}=nothing)
     validate_k(W, k)
-    restarts >= 1 && kicks >= 0 ||
-        throw(ArgumentError("restarts must be positive and kicks nonnegative"))
     rng = isnothing(seed) ? Random.default_rng() : Xoshiro(seed)
     scores = subset_scores(W)
     if !isnothing(voice)
         validate_voice_config(voice)
-        validate_policy(policy)
-        scores .+= voice_subset_scores(W, voice, policy)
+        scores .+= voice_subset_scores(W, voice)
     end
     greedy_order = sortperm(interference_caused(W); rev=true)
     best, best_score = zeros(Int, W.n), -Inf
-    assign, masks = zeros(Int, W.n), zeros(Int, k)
-    trial, trial_masks = similar(assign), similar(masks)
+    part = Partition(zeros(Int, W.n), zeros(Int, k))
+    trial = Partition(zeros(Int, W.n), zeros(Int, k))
 
-    for restart in 1:restarts
-        greedy_fill!(assign, masks, scores, restart == 1 ? greedy_order : randperm(rng, W.n))
-        polish!(scores, assign, masks)
-        score = masks_score(scores, masks)
-        for _ in 1:kicks
-            copyto!(trial, assign)
-            copyto!(trial_masks, masks)
+    for restart in 1:RESTARTS
+        greedy_fill!(part, scores, restart == 1 ? greedy_order : randperm(rng, W.n))
+        polish!(scores, part)
+        score = masks_score(scores, part)
+        for _ in 1:KICKS
+            copyto!(trial, part)
             for _ in 1:rand(rng, min(2, W.n):min(4, W.n))
-                move!(trial, trial_masks, rand(rng, 1:W.n), rand(rng, 1:k))
+                move!(trial, rand(rng, 1:W.n), rand(rng, 1:k))
             end
-            polish!(scores, trial, trial_masks)
-            trial_score = masks_score(scores, trial_masks)
+            polish!(scores, trial)
+            trial_score = masks_score(scores, trial)
             if trial_score >= score
-                copyto!(assign, trial)
-                copyto!(masks, trial_masks)
+                copyto!(part, trial)
                 score = trial_score
             end
         end
         if score > best_score
-            copyto!(best, assign)
+            copyto!(best, part.assign)
             best_score = score
         end
     end
-    return best, best_score
+    return canonical!(best), best_score
 end
 
-# Best split of `mask` into one more channel than `previous` covers: the channel holding the mask's
-# lowest AP plus the best split of the rest. `previous` is indexed by masks without AP 1 (even masks).
 @inline function best_split(scores, previous, mask)
     low = mask & -mask
     rest = mask ⊻ low
@@ -822,10 +880,6 @@ end
     return value, block
 end
 
-# Exact optimum over every split of the APs into at most k channels. Layer j holds the best split of
-# each mask into j channels. AP 1 always opens the first channel, so lower layers only need masks
-# without it, and the top layer only the full set. With k >= n every AP gets its own channel, since
-# sharing a channel only lowers rates.
 function brute_force_fast(W::World; k::Integer=W.cfg.k_channels)
     validate_k(W, k)
     if k >= W.n
@@ -859,7 +913,7 @@ function brute_force_fast(W::World; k::Integer=W.cfg.k_channels)
         mask == 0 && break
         block = layer == 2 ? mask : Int(picks[layer - 1][(mask >> 1) + 1])
     end
-    return assign, value
+    return canonical!(assign), value
 end
 
 function brute_force_naive(W::World)

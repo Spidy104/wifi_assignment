@@ -13,7 +13,7 @@ On top of that there's a voice model: two-way calls with a 150 ms deadline, back
 DCF fixed point with 10 dB capture, and four queueing policies (FIFO or deadline priority, fixed or adaptive
 codec). The optimizer can also aim for voice goodput instead of throughput.
 
-The write-ups are in [`paper/results.pdf`](paper/results.pdf) (results) and [`paper/model.pdf`](paper/model.pdf)
+[`API.md`](API.md) explains every exported function. The write-ups are in [`paper/results.pdf`](paper/results.pdf) (results) and [`paper/model.pdf`](paper/model.pdf)
 (the model, the algorithms and how I checked them).
 
 ## Running it
@@ -43,7 +43,7 @@ exact, best = brute_force_fast(world)
 
 voice = VoiceSimConfig(calls_per_ap=32, background_load=0.8)
 results = compare_voice_strategies(world, assignment; cfg=voice)
-tuned, _ = optimize_assignment(world; voice=voice, policy=:combined)
+tuned, _ = optimize_assignment(world; voice=voice)   # voice.policy defaults to :combined
 ```
 
 ## Code
@@ -85,13 +85,13 @@ Median time in ms, 16 clients per AP, 3 channels, heavy demand:
 
 | APs | Original table | New table | Optimize | Exact |
 |---:|---:|---:|---:|---:|
-| 12 | 18.3 | 6.3 | 7.6 | 6.3 |
-| 14 | 93.3 | 6.1 | 14.0 | 11.4 |
-| 16 | 401.2 | 29.4 | 24.8 | 24.2 |
-| 18 | 1799.7 | 73.8 | 72.4 | 97.7 |
+| 12 | 10.7 | 0.8 | 1.8 | 1.1 |
+| 14 | 48.5 | 2.2 | 3.5 | 2.8 |
+| 16 | 229.5 | 11.4 | 11.2 | 13.5 |
+| 18 | 1012.8 | 43.7 | 46.0 | 61.4 |
 
-The new table matches the old one to 4e-13. Light-demand worlds need the fixed point per subset and take up to
-~1.8 s at 18 APs. Timings on my laptop jump around by up to 2× between runs, so read these as rough.
+The new table matches the old one to 4e-13. Light-demand worlds need the fixed point per subset and take
+~0.55 s at 18 APs. Timings on my laptop jump around by up to 2× between runs, so read these as rough.
 
 ### MAC model
 

@@ -46,10 +46,11 @@ function exact_partition_dp(table, channels)
     return layer[end]
 end
 
-function dense_world(n::Int, clients_per_ap::Int, channels::Int, seed::Int, area::Float64)
-    cfg = SimConfig(k_channels=channels, area=area, noise_dbm=-95.0,
-                    bw_mhz=20.0, min_rate=0.001, p0=-30.0,
-                    alpha=35.0, shadow_sigma=8.0)
+dense_config(channels, area) = SimConfig(k_channels=channels, area=area, noise_dbm=-95.0,
+                                         bw_mhz=20.0, min_rate=0.001, p0=-30.0,
+                                         alpha=35.0, shadow_sigma=8.0)
+
+function dense_world(n::Int, clients_per_ap::Int, seed::Int, cfg::SimConfig)
     W = make_world(n=n, cpa=clients_per_ap, cfg=cfg, seed=seed)
     all(>=(1.0), W.ap_activity) || error("the independent oracle assumes saturated APs")
     return W
@@ -74,14 +75,14 @@ end
 function check_dense_correctness()
     @testset "dense exact optimum by independent dynamic programming" begin
         for n in (12, 14), clients_per_ap in (8, 16), seed in (17, 42)
-            W = dense_world(n, clients_per_ap, 3, seed, 80.0)
+            W = dense_world(n, clients_per_ap, seed, dense_config(3, 80.0))
             table = WiFiAssignment.subset_scores(W)
             dp = exact_partition_dp(table, 3)
             assignment, partition = brute_force_fast(W)
             @test isapprox(dp, partition; atol=1e-8, rtol=1e-11)
             @test isapprox(dp, check_dense_assignment(W, assignment); atol=1e-8, rtol=1e-11)
             greedy = greedy_rate(W)
-            annealed, sa_score, history = simulated_annealing(W; seed=seed, iters=250_000)
+            annealed, sa_score, history = simulated_annealing(W; seed=seed, cfg=AnnealConfig(iters=250_000))
             @test check_dense_assignment(W, greedy) <= dp + 1e-8
             @test isapprox(check_dense_assignment(W, annealed), sa_score; atol=1e-8)
             @test sa_score <= dp + 1e-8
@@ -91,7 +92,7 @@ function check_dense_correctness()
 
     @testset "optimize_assignment reaches the independent optimum" begin
         for n in (12, 14, 16), clients_per_ap in (4, 16), seed in 1:5
-            W = dense_world(n, clients_per_ap, 3, seed, 100.0 * sqrt(n / 18))
+            W = dense_world(n, clients_per_ap, seed, dense_config(3, 100.0 * sqrt(n / 18)))
             optimum = exact_partition_dp(WiFiAssignment.subset_scores(W), 3)
             best, score = optimize_assignment(W; seed=seed)
             @test isapprox(score, optimum; atol=1e-8)
@@ -101,7 +102,7 @@ function check_dense_correctness()
 
     @testset "exact search and optimizer for 2, 4 and 5 channels" begin
         for channels in (2, 4, 5), n in (12, 14), clients_per_ap in (4, 16), seed in 1:3
-            W = dense_world(n, clients_per_ap, channels, seed, 100.0 * sqrt(n / 18))
+            W = dense_world(n, clients_per_ap, seed, dense_config(channels, 100.0 * sqrt(n / 18)))
             optimum = exact_partition_dp(WiFiAssignment.subset_scores(W), channels)
             exact, exact_score = brute_force_fast(W)
             @test isapprox(exact_score, optimum; atol=1e-8)
@@ -115,7 +116,7 @@ function check_dense_correctness()
     @testset "18 APs, heavy clients, and stronger transmitters" begin
         for (clients_per_ap, channels, seed, area) in ((16, 3, 1, 8.0), (24, 6, 2, 90.0),
                                                        (32, 12, 3, 120.0), (48, 18, 4, 160.0))
-            W = dense_world(18, clients_per_ap, channels, seed, area)
+            W = dense_world(18, clients_per_ap, seed, dense_config(channels, area))
             rng = Xoshiro(seed)
             for _ in 1:12
                 check_dense_assignment(W, rand(rng, 1:channels, W.n))
@@ -129,7 +130,7 @@ function check_dense_correctness()
             greedy = greedy_rate(W)
             greedy_score = check_dense_assignment(W, greedy)
             annealed, sa_score, history = simulated_annealing(
-                W; seed=seed, iters=1_000_000, T0=20.0, cooling=0.999995)
+                W; seed=seed, cfg=AnnealConfig(iters=1_000_000, T0=20.0, cooling=0.999995))
             @test isapprox(sa_score, check_dense_assignment(W, annealed); atol=1e-8)
             @test sa_score >= maximum(history) - 1e-8
             @test length(history) == 1_000_000
@@ -153,13 +154,13 @@ function check_dense_correctness()
     end
 
     @testset "independent 18 AP exact ceiling" begin
-        W = dense_world(18, 16, 3, 5, 100.0)
+        W = dense_world(18, 16, 5, dense_config(3, 100.0))
         table = WiFiAssignment.subset_scores(W)
         timed = @timed exact_partition_dp(table, 3)
         optimum = timed.value
         plain = check_dense_assignment(W, greedy_rate(W; refine=false))
         refined = check_dense_assignment(W, greedy_rate(W))
-        annealed, score, _ = simulated_annealing(W; seed=5, iters=1_000_000)
+        annealed, score, _ = simulated_annealing(W; seed=5, cfg=AnnealConfig(iters=1_000_000))
         best, best_score = optimize_assignment(W; seed=5)
         @test isapprox(score, check_dense_assignment(W, annealed); atol=1e-8)
         @test isapprox(best_score, check_dense_assignment(W, best); atol=1e-8)
@@ -187,10 +188,11 @@ function sample(f, repetitions::Int)
 end
 
 function allocation_difference(W::World)
-    simulated_annealing(W; seed=44, iters=0)
-    simulated_annealing(W; seed=44, iters=1_000_000)
-    baseline = @allocated simulated_annealing(W; seed=44, iters=0)
-    long = @allocated simulated_annealing(W; seed=44, iters=1_000_000)
+    none, million = AnnealConfig(iters=0), AnnealConfig(iters=1_000_000)
+    simulated_annealing(W; seed=44, cfg=none)
+    simulated_annealing(W; seed=44, cfg=million)
+    baseline = @allocated simulated_annealing(W; seed=44, cfg=none)
+    long = @allocated simulated_annealing(W; seed=44, cfg=million)
     return long - baseline
 end
 
@@ -205,19 +207,19 @@ function benchmark_density()
                                     (18, 32, 6, 25, 120.0),
                                     (18, 48, 12, 26, 160.0),
                                     (18, 64, 18, 27, 160.0))
-        W = dense_world(n, cpa, k, seed, area)
+        W = dense_world(n, cpa, seed, dense_config(k, area))
         count = n * cpa
         repeats = count > 500 ? 2 : 3
         subset_time, _ = sample(() -> WiFiAssignment.subset_scores(W), repeats)
         greedy_time, _ = sample(() -> greedy_rate(W), repeats)
         anneal_time, anneal_bytes = sample(
-            () -> simulated_annealing(W; seed=42, iters=1_000_000), repeats)
+            () -> simulated_annealing(W; seed=42, cfg=AnnealConfig(iters=1_000_000)), repeats)
         @printf("%4d %8d %4d %12.3f %12.3f %13.3f %11.2f\n",
                 n, count, k, subset_time, greedy_time, anneal_time,
                 anneal_bytes / 1024^2)
     end
 
-    W = dense_world(18, 32, 6, 73, 120.0)
+    W = dense_world(18, 32, 73, dense_config(6, 120.0))
     extra = allocation_difference(W)
     @printf("Extra allocation for 1,000,000 SA steps: %d bytes; history: 8,000,000 bytes\n", extra)
 end
