@@ -1,0 +1,101 @@
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=2cm]{geometry}
+\usepackage{lmodern,microtype,amsmath,booktabs,caption,siunitx,xcolor,hyperref}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\hypersetup{colorlinks,linkcolor=black,urlcolor=blue!50!black}
+\captionsetup{font=small,labelfont=bf,skip=4pt}
+\input{generated/numbers.tex}
+\newcommand{\figtable}[2]{\par\medskip\noindent\begin{minipage}{\linewidth}\centering\captionof{table}{#1}#2
+  \end{minipage}\par\medskip}
+
+\title{Channel assignment and voice QoS in synthetic 802.11 networks:\\ results}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent All numbers below are produced by \texttt{paper/results.jl} on synthetic worlds (\threads{} threads);
+the model and methods are described in the companion document \texttt{model.pdf}.
+A world places up to 18 access points (APs) at random, each with its clients, and an assignment picks one channel per AP.
+The throughput objective is proportional fairness, $\sum_c \log r_c$ over client rates $r_c$, measured in nats.
+
+\section{Channel assignment against the exact optimum}
+
+Each method is scored against the exact optimum from the subset dynamic program, on \qualityWorlds{} worlds:
+10, 14 and 18 APs, 4 and 16 clients per AP, ten seeds per setting for 2, 3, 4 and 6 channels at 40\,Mbps demand,
+and five seeds for 3 channels at 3\,Mbps (``light'', where APs are not saturated and the airtime fixed point is active).
+These worlds use an area of $100\sqrt{n/18}$\,m per side, 8\,dB shadowing and a 0.001\,Mbps rate floor; the voice
+scenarios use the default model. Annealing runs 50\,000 moves.
+
+\figtable{Share of worlds solved exactly (gap below $10^{-9}$ nats), by number of channels.}{\input{generated/optimal.tex}}
+
+\figtable{Gap to the optimum in nats: median (worst), by number of channels.}
+{\small\setlength{\tabcolsep}{4pt}\input{generated/gaps.tex}}
+
+\noindent \texttt{optimize\_assignment} reaches the optimum in every world (worst gap \num{\optimizeWorstGap} nats).
+The original single-pass greedy is \greedyPlainMedianGap{} nats short in the median and up to \greedyPlainWorstGap{} nats.
+
+\section{Speed}
+
+\figtable{Median wall time in ms, 16 clients per AP, 3 channels. ``Original table'' is the original single-threaded
+subset-table algorithm (same output to within \num{\originalTableDeviation}); it does not apply to light demand, which needs
+the per-group airtime fixed point. ``Voice-aware'' is the optimizer with the voice objective (64 calls per AP, 75\,\%
+background load).}{\input{generated/speed.tex}}
+
+\section{Model validation}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{axis}[width=0.46\linewidth,height=5cm,xlabel={contenders $n$},ylabel={collision probability},
+             legend pos=south east,legend style={font=\small},title={Bianchi contention}]
+\addplot[thick,blue] table[x=n,y=model]{generated/bianchi.dat};
+\addplot[only marks,mark=o,red] table[x=n,y=simulation]{generated/bianchi.dat};
+\legend{model,slot simulation}
+\end{axis}
+\end{tikzpicture}\hfill
+\begin{tikzpicture}
+\begin{axis}[width=0.46\linewidth,height=5cm,xlabel={hidden AP airtime $u$},ylabel={overlap probability},
+             legend pos=south east,legend style={font=\small},title={Hidden transmitter}]
+\addplot[thick,blue] table[x=u,y=model]{generated/hidden.dat};
+\addplot[only marks,mark=o,red] table[x=u,y=simulation]{generated/hidden.dat};
+\addplot[dashed,gray] table[x=u,y=aloha]{generated/hidden.dat};
+\legend{model,simulation,ALOHA $1-e^{-2u}$}
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{Collision models against simulation. The voice scenarios reach at most \maxContenders{} contenders (the AP
+plus the co-channel APs it senses); up to that, Bianchi's fixed point is within \bianchiErrorScenario{} of a slot-level DCF
+simulation, and within \bianchiErrorLarge{} up to 10. The single-transmitter overlap formula is within \hiddenError{};
+the ALOHA formula it replaced was off by up to \alohaError{}.}
+\end{center}
+
+\figtable{Steady-state voice estimate (used by the voice-aware objective) against \texttt{simulate\_voice}: worst
+absolute error in loss (percentage points) / codec rate (kbps) over 20 assignments per cell.}{\input{generated/estimate.tex}}
+
+\noindent The queue simulator matches the closed-form steady state of an isolated AP in all \isolatedCases{} cases
+(loss within \isolatedLossError{} points, codec within \isolatedCodecError{} kbps), and the voice-aware optimizer matches an
+exhaustive search of its objective in all \voiceExactCases{} cases (worst gap \num{\voiceExactGap}).
+
+\section{Voice}
+
+\figtable{Voice outcomes on throughput-optimal assignments, 20 worlds per scenario, 10\,s simulated.}
+{\small\input{generated/voice.tex}}
+
+\figtable{Throughput-only against voice-aware assignment (same policy for both): median loss, worlds where voice goodput
+rises / falls, and the cost to data clients in nats per client.}{\small\setlength{\tabcolsep}{4pt}\input{generated/aware.tex}}
+
+\noindent Paired sign tests over \hOneWorlds{} worlds: deadline scheduling beats adaptation alone on loss in \hOneWins{}
+worlds (\hOneTies{} tied, \hOneLosses{} lost; median \hOneMedian{} points, $p = \num{\hOneP}$) and cuts p95 delay in
+\hOneBWins{} (median \hOneBMedian{}\,ms, $p = \num{\hOneBP}$). Under voice overload, priority with codec adaptation beats
+fixed-rate priority in \hTwoWins{} of \hTwoWorlds{} worlds (median \hTwoMedian{} points, $p = \num{\hTwoP}$) at a median
+codec reduction of \hTwoCodecCut{}\,kbps, and keeps at least 99\,\% of the codec rate in \hThreeKept{} of \hThreeTrials{}
+normal-load trials.
+
+\section{Limits}
+Worlds, traffic and shadowing are synthetic and static. The voice model is an aggregate work queue, not a packet-level
+802.11 simulator: Bianchi treats partly busy APs as fractional contenders, and each AP's own clients count as one contender,
+which likely understates collisions in call-heavy cells. The exact methods cover up to 18 APs. External validation needs
+ns-3, packet traces or hardware.
+
+\end{document}

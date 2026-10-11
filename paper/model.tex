@@ -1,0 +1,186 @@
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{lmodern,microtype,amsmath,amssymb,booktabs,caption,enumitem,siunitx,xcolor,hyperref}
+\hypersetup{colorlinks,linkcolor=black,citecolor=black,urlcolor=blue!50!black}
+\captionsetup{font=small,labelfont=bf}
+\setlist{itemsep=1pt,topsep=3pt}
+\input{generated/numbers.tex}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Channel assignment and voice QoS in synthetic 802.11 networks:\\ model, methods and verification}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent This note describes a Julia model (\code{WiFiAssignment.jl}) that assigns channels to 802.11 access points so
+as to maximise proportional fairness of client throughput, optionally together with the quality of voice calls carried
+over the same network. It covers the radio and airtime model, the subset-table formulation that makes exact optimisation
+possible for up to 18 access points, the heuristics, the voice queue and MAC model, the voice-aware objective, and how
+each component is checked against an independent reference. Results are in the companion \code{results.pdf}.
+\end{abstract}
+
+\section{Network model}
+
+\paragraph{Geometry and propagation.}
+A world has $n \le 18$ access points (APs) placed uniformly in an $A \times A$ square, each serving $m$ clients placed at a
+uniform distance of 5--15\,m and uniform angle from it (clipped to the square). Received power over distance $d$ is
+\[
+  P\ [\mathrm{dBm}] = p_0 - \alpha \log_{10}\max(d, 1) + \sigma Z, \qquad Z \sim \mathcal N(0,1),
+\]
+drawn independently per AP--client link and once per AP pair (symmetric). Defaults are $p_0 = -30$\,dBm, $\alpha = 35$
+(path-loss exponent 3.5), $\sigma = 4$\,dB, noise $N_0 = -95$\,dBm, bandwidth $B = 20$\,MHz. Two APs \emph{sense} each
+other when their mutual received power is at least the carrier-sense threshold ($-82$\,dBm); co-channel APs that do not
+sense each other are \emph{hidden} from one another.
+
+\paragraph{Client rates.}
+An assignment $x$ gives each AP one of $k$ orthogonal channels. For client $c$ of AP $j$, with signal $S_c$, let
+$\mathcal S_j(x)$ and $\mathcal H_j(x)$ be the co-channel APs that $j$ senses and does not sense, and $a_i \in [0,1]$ the
+airtime of AP $i$. Hidden APs interfere in proportion to their airtime; sensed APs share airtime:
+\begin{align*}
+  \phi_c &= \min\!\Big(R_{\max},\; B \log_2\Big(1 + \frac{S_c}{N_0 + \sum_{h \in \mathcal H_j(x)} a_h P_{c,h}}\Big)\Big), \\
+  r_c &= \min\!\Big(D,\; \max\!\Big(\frac{\eta\, \phi_c}{m\,\big(1 + \sum_{s \in \mathcal S_j(x)} a_s\big)},\; r_{\min}\Big)\Big),
+\end{align*}
+with PHY cap $R_{\max} = 144$\,Mbps, MAC efficiency $\eta = 0.72$, per-client demand $D = 40$\,Mbps and floor
+$r_{\min} = 0.5$\,Mbps. The objective is proportional fairness \cite{kelly},
+\[
+  U(x) = \sum_c \log r_c \quad \text{(nats)}.
+\]
+
+\paragraph{Airtime as a fixed point.}
+An AP's airtime is what its clients' demand needs at the rates they actually get:
+\[
+  a_j = \min\!\Big(1,\; \sum_{c \in j} \frac{D}{\eta \max(\phi_c(a), r_{\min})}\Big).
+\]
+Because $\phi_c$ falls as hidden APs' airtime rises, the right-hand side is monotone in $a$, so iterating from the
+interference-free airtime converges to the least fixed point. When every AP already needs all its airtime (the default
+demand with three or more clients per AP), the fixed point is $a \equiv 1$ and the iteration is skipped. Like every
+iterative solver in the code, it raises an error rather than return an unconverged value.
+
+\section{Optimisation}
+
+\paragraph{Separability.}
+Every term in $r_c$ depends only on the set $G$ of APs sharing AP $j$'s channel, so
+$U(x) = \sum_{\text{channels}} f(G_{\text{ch}})$ with $f(G) = \sum_{j \in G} \sum_{c \in j} \log r_c(G)$. The $2^n$ values of
+$f$ are tabulated once; any assignment then costs $k$ lookups and moving one AP costs four.
+
+\paragraph{Building the table.}
+For saturated worlds interference and blocked airtime add over APs, so each client needs subset-sum tables over the low
+and high halves of the AP index (and each AP one table of blocked airtime); entries are formed row by row in parallel,
+with up to 16 client rates multiplied before one logarithm. For unsaturated worlds each entry solves its own airtime
+fixed point. Both paths are deterministic and give bit-identical results for any thread count.
+
+\paragraph{Heuristics.}
+\begin{itemize}
+\item \emph{Graph colouring} (baseline): conflict graph at $-75$\,dBm, APs in decreasing degree, least-conflicting colour.
+\item \emph{Greedy}: APs in decreasing order of the power they put on other APs' clients, each placed on the channel with
+  the largest marginal table gain; optionally followed by \emph{local search} over single-AP moves and pairwise swaps until
+  neither improves the objective.
+\item \emph{Simulated annealing}: random start, random single-AP moves with Metropolis acceptance and geometric cooling to
+  $T_0/100$. $T_0$ is calibrated so the mean downhill move from the start is accepted with probability $1/2$ (from 200
+  sampled moves), and the best assignment is finished with local search.
+\item \code{optimize\_assignment}: iterated local search. Eight restarts (the greedy order, then random orders), each
+  followed by 200 kicks that reassign 2--4 random APs and re-run local search, keeping the result when it is no worse.
+\end{itemize}
+
+\paragraph{Exact search.}
+Let $B_j(M)$ be the best split of AP set $M$ into at most $j$ channels. The channel holding the lowest AP of $M$ is some
+$G \subseteq M$, so
+\[
+  B_1(M) = f(M), \qquad B_j(M) = \max_{G \ni \min M,\; G \subseteq M} \big[f(G) + B_{j-1}(M \setminus G)\big],
+\]
+and the optimum is $B_k(\{1,\dots,n\})$. AP 1 always opens the first channel, so the intermediate layers only need sets
+without it, and the top layer only the full set: about $(k-2)\,3^{n-1}/2$ operations, parallel over sets. When $k \ge n$
+every AP gets its own channel, which is optimal because adding an AP to a channel can only lower its members' rates.
+
+\section{Voice model}
+
+\paragraph{Traffic and queues.}
+Each AP carries $K$ two-way calls, i.e.\ $2K$ flows that each send one packet per 20\,ms frame of
+$b\cdot 20\,\text{ms} + 480$ bits at codec rate $b$ (64\,kbps nominal, 12\,kbps minimum), with a 150\,ms deadline.
+An AP's raw capacity per frame is the sum of its clients' rates. Background traffic offers a fraction $\rho$ of that
+capacity. Under FIFO, voice and background of a frame interleave, so each frame enters the queue as one mixed item and voice
+loses in proportion to its share when the queue overflows; under priority scheduling only voice is queued. Work older than
+the deadline is dropped from the head of the queue, and delay is measured at the time the packet's bits finish within the
+frame.
+
+\paragraph{MAC.}
+AP $j$'s utilisation is $u_j = \min(1, \rho + \text{voice bits}/\text{raw capacity})$. A transmission collides with
+probability
+\[
+  p_j = 1 - \big(1 - p^{\mathrm B}(1 + \textstyle\sum_{s \in \mathcal S_j} u_s)\big)
+            \prod_{h \in \mathcal H_j} \big(1 - \sigma_{jh}\, q(u_h)\big),
+\]
+where $p^{\mathrm B}(n)$ is Bianchi's DCF fixed point \cite{bianchi} for $n$ contenders,
+$p = 1 - (1-\tau)^{n-1}$, $\tau = 2/(1 + W + pW\sum_{i<m}(2p)^i)$ with $W = 16$ and $m = 6$ backoff stages (802.11 OFDM),
+solved by a bracketed Newton iteration. A hidden AP busy a fraction $u$ of the time overlaps a frame with probability
+$q(u) = u + (1-u)\big(1 - e^{-u/(1-u)}\big)$ (busy at its start, or starting during it, with frames of equal length and
+exponential idle gaps), and $\sigma_{jh}$ is the share of $j$'s clients whose signal is within the 10\,dB capture
+threshold of $h$'s. With $R = 2$ retries, service is capacity divided by $\sum_{i=0}^{R} p_j^i$ expected attempts, and a
+fraction $p_j^{R+1}$ of served packets is lost.
+
+\paragraph{Policies.}
+\code{:fifo} and \code{:deadline} use the nominal codec; \code{:adaptive} (FIFO) and \code{:combined} (priority) move the codec
+35\,\% of the way per frame towards the rate at which voice fits the airtime left to it, the service minus background under
+FIFO and the whole service under priority, so the codec only shrinks when voice does not fit.
+
+\paragraph{Voice-aware objective.}
+An AP's voice outcome depends only on the APs sharing its channel, so it adds a second term to $f(G)$. For each $G$ the
+steady state of the simulator (utilisation, collisions and codec rate) is solved as a joint fixed point, and each flow
+contributes $\log(b/b_{\text{nominal}} \cdot \text{delivered fraction})$, so codec quality and loss both count and data
+clients and voice flows are treated alike by proportional fairness. The same heuristics and exact search then apply
+unchanged.
+
+\section{Verification}
+
+Each component is checked against a reference that shares no code with it. The counts below come from the
+deterministic checks in \code{benchmarks/stress.jl} and \code{benchmarks/dense.jl}; the other figures are produced
+by \code{paper/results.jl}.
+\begin{itemize}
+\item rates, scores and the airtime fixed point against an independent dB-domain implementation with its own Jacobi
+  iteration: exhaustive search over 1--5 channels and up to 6 APs (5\,850 checks), every table entry of 40 worlds
+  (8\,304), and 96 worlds of 1--18 APs (14\,112);
+\item exact search and \code{optimize\_assignment} against an independent subset dynamic program for 2--5 channels
+  (8\,376 checks for 3 channels, 9\,936 for 2, 4 and 5) and against each other at 18 APs for 3, 6, 12 and 18 channels;
+\item the voice queue against the closed-form steady state of an isolated AP (\isolatedCases{} cases, loss within
+  \isolatedLossError{} points), and packet accounting on 40 random worlds;
+\item Bianchi's model against a slot-level DCF simulation (within \bianchiErrorScenario{} up to \maxContenders{} contenders,
+  the most the voice scenarios reach) and the hidden overlap formula against simulation (within \hiddenError{});
+\item the steady-state voice estimate against the simulator (loss within \estimateLossError{} points, codec within
+  \estimateCodecError{} kbps), and the voice-aware optimizer against exhaustive search (\voiceExactCases{} cases).
+\end{itemize}
+
+\section{Changes made to the original code}
+
+\begin{itemize}
+\item \emph{Subset table}: rebuilt around per-client half-mask subset sums, one logarithm per group of client rates and
+  parallel rows; it reproduces the original table to within \num{\originalTableDeviation}.
+\item \emph{Heuristics}: local search after greedy, calibrated temperature and final polish for annealing, and the new
+  iterated local search \code{optimize\_assignment}.
+\item \emph{Exact search}: from three channels and 14 APs to any number of channels and 18 APs.
+\item \emph{Airtime}: from the interference-free demand to the fixed point above.
+\item \emph{Voice}: the adaptive codec now accounts for background traffic and only shrinks when voice does not fit;
+  background work expires instead of accumulating; FIFO mixes voice and background in proportion instead of placing voice
+  in the middle of each frame; delay is measured within the frame instead of at frame boundaries; the collision model
+  $1 - e^{-0.12\,|\mathcal H_j|\,u_j}$ (capped at 0.65) is replaced by Bianchi contention plus capture-weighted
+  hidden-terminal overlap.
+\item \emph{Voice-aware assignment} and loud failure of every iterative solver.
+\end{itemize}
+
+\section{Limitations}
+Worlds, traffic and shadowing are synthetic and static, and channels are orthogonal. The voice model is an aggregate work
+queue rather than a packet-level 802.11 simulation. Bianchi assumes saturated contenders, so partly busy APs enter as
+fractional contenders, and each AP's own clients count as a single contender, which likely understates collisions in
+call-heavy cells. The exact methods are limited to 18 APs by the $2^n$ table. Conclusions hold for this model; external
+validation needs ns-3, packet traces or hardware.
+
+\begin{thebibliography}{9}
+\bibitem{bianchi} G.~Bianchi, ``Performance analysis of the IEEE 802.11 distributed coordination function,''
+  \emph{IEEE Journal on Selected Areas in Communications}, vol.~18, no.~3, pp.~535--547, 2000.
+\bibitem{kelly} F.~Kelly, ``Charging and rate control for elastic traffic,''
+  \emph{European Transactions on Telecommunications}, vol.~8, no.~1, pp.~33--37, 1997.
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,22 @@
+\begin{tabular}{llrrrr}
+\toprule
+Scenario & Policy & Loss (median) & Loss (worst) & p95 delay (ms) & Codec (kbps) \\
+\midrule
+Branch office & \texttt{:fifo} & 0.01\,\% & 0.65\,\% & 7.8 & 64.0 \\
+ & \texttt{:deadline} & 0.01\,\% & 0.65\,\% & 0.4 & 64.0 \\
+ & \texttt{:adaptive} & 0.01\,\% & 0.65\,\% & 7.8 & 64.0 \\
+ & \texttt{:combined} & 0.01\,\% & 0.65\,\% & 0.4 & 64.0 \\
+Open-plan office & \texttt{:fifo} & 0.16\,\% & 2.10\,\% & 17.5 & 64.0 \\
+ & \texttt{:deadline} & 0.16\,\% & 1.03\,\% & 1.8 & 64.0 \\
+ & \texttt{:adaptive} & 0.16\,\% & 1.44\,\% & 17.5 & 64.0 \\
+ & \texttt{:combined} & 0.16\,\% & 1.03\,\% & 1.8 & 64.0 \\
+High-density call centre & \texttt{:fifo} & 11.73\,\% & 19.31\,\% & 140.0 & 64.0 \\
+ & \texttt{:deadline} & 1.19\,\% & 3.45\,\% & 8.5 & 64.0 \\
+ & \texttt{:adaptive} & 5.05\,\% & 9.83\,\% & 140.0 & 36.5 \\
+ & \texttt{:combined} & 1.19\,\% & 3.45\,\% & 8.5 & 64.0 \\
+Emergency overload stress & \texttt{:fifo} & 40.85\,\% & 46.89\,\% & 140.0 & 64.0 \\
+ & \texttt{:deadline} & 5.55\,\% & 15.09\,\% & 140.0 & 64.0 \\
+ & \texttt{:adaptive} & 20.85\,\% & 27.84\,\% & 140.0 & 12.2 \\
+ & \texttt{:combined} & 0.53\,\% & 2.90\,\% & 37.6 & 59.6 \\
+\bottomrule
+\end{tabular}

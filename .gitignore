@@ -1,0 +1,9 @@
+*.png
+*.aux
+*.log
+*.fls
+*.fdb_latexmk
+*.out
+*.synctex.gz
+*.toc
+paper/email_draft.txt

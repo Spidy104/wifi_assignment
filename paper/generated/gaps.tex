@@ -1,0 +1,12 @@
+\begin{tabular}{lrrrrr}
+\toprule
+Method & \multicolumn{1}{c}{2} & \multicolumn{1}{c}{3} & \multicolumn{1}{c}{4} & \multicolumn{1}{c}{6} & \multicolumn{1}{c}{3, light} \\
+\midrule
+Graph colouring & 27.56 (126.77) & 40.94 (270.56) & 67.49 (353.05) & 95.56 (437.04) & 38.17 (177.81) \\
+Greedy, single pass (original) & 10.30 (89.59) & 12.88 (72.33) & 11.48 (60.76) & 6.09 (53.02) & 2.98 (40.81) \\
+Greedy with local search & 0.00 (43.26) & 1.12 (21.45) & 1.20 (38.15) & 0.34 (9.59) & 0.00 (11.88) \\
+Annealing, fixed $T_0 = 5$, no polish & 0.00 (0.00) & 0.00 (3.49) & 0.00 (1.55) & 0.00 (5.68) & 0.00 (0.00) \\
+Annealing, calibrated $T_0$, polish & 0.00 (0.00) & 0.00 (0.00) & 0.00 (3.82) & 0.00 (3.09) & 0.00 (0.13) \\
+\texttt{optimize\_assignment} & 0.00 (0.00) & 0.00 (0.00) & 0.00 (0.00) & 0.00 (0.00) & 0.00 (0.00) \\
+\bottomrule
+\end{tabular}

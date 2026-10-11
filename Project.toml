@@ -1,0 +1,12 @@
+name = "WiFiAssignment"
+uuid = "dace0ea4-1879-4611-b7c9-d515bd061859"
+version = "0.1.0"
+
+[deps]
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+
+[compat]
+julia = "1.13"
+
+[workspace]
+projects = ["test", "benchmarks"]

@@ -1,0 +1,6 @@
+[deps]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+WiFiAssignment = "dace0ea4-1879-4611-b7c9-d515bd061859"
+
+[sources]
+WiFiAssignment = {path = ".."}

@@ -1,0 +1,12 @@
+\begin{tabular}{lrrrrr}
+\toprule
+Method & \multicolumn{1}{c}{2} & \multicolumn{1}{c}{3} & \multicolumn{1}{c}{4} & \multicolumn{1}{c}{6} & \multicolumn{1}{c}{3, light} \\
+\midrule
+Graph colouring & 2\,\% & 2\,\% & 0\,\% & 0\,\% & 10\,\% \\
+Greedy, single pass (original) & 2\,\% & 0\,\% & 3\,\% & 3\,\% & 37\,\% \\
+Greedy with local search & 63\,\% & 38\,\% & 30\,\% & 43\,\% & 73\,\% \\
+Annealing, fixed $T_0 = 5$, no polish & 100\,\% & 95\,\% & 90\,\% & 72\,\% & 100\,\% \\
+Annealing, calibrated $T_0$, polish & 100\,\% & 100\,\% & 92\,\% & 80\,\% & 97\,\% \\
+\texttt{optimize\_assignment} & 100\,\% & 100\,\% & 100\,\% & 100\,\% & 100\,\% \\
+\bottomrule
+\end{tabular}

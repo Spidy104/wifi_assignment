@@ -1,0 +1,22 @@
+\begin{tabular}{llrrrrr}
+\toprule
+Scenario & Policy & Loss before & Loss after & Goodput up/down & Cost (median) & Cost (max) \\
+\midrule
+Branch office & \texttt{:fifo} & 0.01\,\% & 0.01\,\% & 1 / 0 & 0.000 & 0.000 \\
+ & \texttt{:deadline} & 0.01\,\% & 0.01\,\% & 1 / 0 & 0.000 & 0.000 \\
+ & \texttt{:adaptive} & 0.01\,\% & 0.01\,\% & 1 / 0 & 0.000 & 0.000 \\
+ & \texttt{:combined} & 0.01\,\% & 0.01\,\% & 1 / 0 & 0.000 & 0.000 \\
+Open-plan office & \texttt{:fifo} & 0.16\,\% & 0.08\,\% & 2 / 0 & 0.000 & 0.034 \\
+ & \texttt{:deadline} & 0.16\,\% & 0.16\,\% & 0 / 0 & 0.000 & 0.000 \\
+ & \texttt{:adaptive} & 0.16\,\% & 0.06\,\% & 3 / 0 & 0.000 & 0.034 \\
+ & \texttt{:combined} & 0.16\,\% & 0.16\,\% & 0 / 0 & 0.000 & 0.000 \\
+High-density call centre & \texttt{:fifo} & 11.73\,\% & 8.42\,\% & 17 / 0 & 0.039 & 0.092 \\
+ & \texttt{:deadline} & 1.19\,\% & 0.58\,\% & 9 / 0 & 0.000 & 0.033 \\
+ & \texttt{:adaptive} & 5.05\,\% & 2.17\,\% & 19 / 0 & 0.084 & 0.181 \\
+ & \texttt{:combined} & 1.19\,\% & 0.58\,\% & 9 / 0 & 0.000 & 0.033 \\
+Emergency overload stress & \texttt{:fifo} & 40.85\,\% & 40.36\,\% & 16 / 0 & 0.010 & 0.042 \\
+ & \texttt{:deadline} & 5.55\,\% & 3.38\,\% & 19 / 0 & 0.034 & 0.078 \\
+ & \texttt{:adaptive} & 20.85\,\% & 19.79\,\% & 16 / 0 & 0.023 & 0.076 \\
+ & \texttt{:combined} & 0.53\,\% & 0.65\,\% & 19 / 0 & 0.032 & 0.088 \\
+\bottomrule
+\end{tabular}
